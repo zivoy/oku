@@ -22,7 +22,8 @@ const (
 	attemptTimeout = 10 * time.Second
 	maxRetries     = 3
 
-	// minRequestInterval keeps us under Hardcover's 60 req/min limit.
+	// minRequestInterval keeps us under Hardcover's 60 req/min limit; it is the
+	// fallback until the API reports its own policy.
 	minRequestInterval = time.Second
 
 	// maxErrorBody bounds how much of a non-2xx response body is kept for
@@ -52,8 +53,10 @@ type Client struct {
 	mu      sync.Mutex
 	lastReq time.Time
 
-	// rateLimit is the most recent quota state the API reported, guarded by mu.
-	rateLimit *RateLimit
+	// rateLimit is the most recent quota state the API reported and
+	// rateLimitAt when it arrived, both guarded by mu.
+	rateLimit   *RateLimit
+	rateLimitAt time.Time
 }
 
 // LastRateLimit returns the quota state from the most recent response that
@@ -67,6 +70,7 @@ func (c *Client) LastRateLimit() *RateLimit {
 func (c *Client) setRateLimit(rl *RateLimit) {
 	c.mu.Lock()
 	c.rateLimit = rl
+	c.rateLimitAt = time.Now()
 	c.mu.Unlock()
 }
 
@@ -271,21 +275,35 @@ func remaining(ctx context.Context) time.Duration {
 	return time.Until(deadline)
 }
 
-// throttle spaces requests at least minRequestInterval apart to respect the
-// 60 req/min rate limit. The slot is reserved under the lock and the wait
-// happens outside it, so concurrent callers queue up rather than blocking each
-// other, and a cancelled context aborts the wait.
+// throttle spaces requests to respect the API's rate limit: the interval is
+// derived from the policy the API last reported, falling back to
+// minRequestInterval (60 req/min), and an exhausted quota holds requests until
+// its reset. The slot is reserved under the lock and the wait happens outside
+// it, so concurrent callers queue up rather than blocking each other, and a
+// cancelled context aborts the wait.
 func (c *Client) throttle(ctx context.Context) error {
 	c.mu.Lock()
-	var wait time.Duration
+	now := time.Now()
+	slot := now
 	if !c.lastReq.IsZero() {
-		if elapsed := time.Since(c.lastReq); elapsed < minRequestInterval {
-			wait = minRequestInterval - elapsed
+		if next := c.lastReq.Add(c.intervalLocked()); next.After(slot) {
+			slot = next
 		}
+	}
+	if resetAt, ok := c.quotaResetLocked(); ok && resetAt.After(slot) {
+		slot = resetAt
+	}
+	wait := slot.Sub(now)
+	// A wait that outlasts the request (a spent daily budget resets hours
+	// away) can only end in a bare timeout, so say what is wrong now, without
+	// reserving the slot.
+	if wait >= remaining(ctx) {
+		c.mu.Unlock()
+		return fmt.Errorf("rate limit exhausted; resets in %s", wait.Round(time.Second))
 	}
 	// Record when the request will actually go out, so a backoff that already
 	// covered the interval does not trigger a second full wait.
-	c.lastReq = time.Now().Add(wait)
+	c.lastReq = slot
 	c.mu.Unlock()
 
 	if wait <= 0 {
@@ -297,6 +315,39 @@ func (c *Client) throttle(ctx context.Context) error {
 	case <-time.After(wait):
 		return nil
 	}
+}
+
+// intervalLocked is the steady-state gap between requests: the plan's window
+// divided by its quota when the API reported one, else minRequestInterval. The
+// daily budget is spent, not paced, so it plays no part. Callers must hold c.mu.
+func (c *Client) intervalLocked() time.Duration {
+	if c.rateLimit != nil {
+		if l := c.rateLimit.Rate(); l != nil {
+			if d := l.Window / time.Duration(l.Quota); d > 0 {
+				return d
+			}
+		}
+	}
+	return minRequestInterval
+}
+
+// quotaResetLocked reports when the latest exhausted limit refills. ok is
+// false when every limit has requests left, no state is known, or the reset
+// has already passed. A reset of 0 means the RateLimit header carried no t, so
+// an empty-looking limit can't be trusted. Callers must hold c.mu.
+func (c *Client) quotaResetLocked() (resetAt time.Time, ok bool) {
+	if c.rateLimit == nil {
+		return time.Time{}, false
+	}
+	for _, l := range c.rateLimit.Limits {
+		if l.Remaining > 0 || l.Reset <= 0 {
+			continue
+		}
+		if at := c.rateLimitAt.Add(l.Reset); at.After(resetAt) {
+			resetAt = at
+		}
+	}
+	return resetAt, resetAt.After(time.Now())
 }
 
 func withRequestTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
