@@ -51,6 +51,23 @@ type Client struct {
 	// 60 req/min = 1 per second is a safe margin.
 	mu      sync.Mutex
 	lastReq time.Time
+
+	// rateLimit is the most recent quota state the API reported, guarded by mu.
+	rateLimit *RateLimit
+}
+
+// LastRateLimit returns the quota state from the most recent response that
+// carried rate limit headers, or nil if none has been seen.
+func (c *Client) LastRateLimit() *RateLimit {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.rateLimit
+}
+
+func (c *Client) setRateLimit(rl *RateLimit) {
+	c.mu.Lock()
+	c.rateLimit = rl
+	c.mu.Unlock()
 }
 
 // NetworkError marks transient request failures (timeouts, 429, 5xx, transport errors).
@@ -84,6 +101,8 @@ type StatusError struct {
 	Body string
 	// RetryAfter is the parsed Retry-After header, or 0 when absent or unparseable.
 	RetryAfter time.Duration
+	// RateLimit is the quota state from the response headers, nil when absent.
+	RateLimit *RateLimit
 }
 
 func (e *StatusError) Error() string {
@@ -98,12 +117,19 @@ func (e *StatusError) Error() string {
 // classification logic can match on the status code.
 type statusTransport struct {
 	base http.RoundTripper
+	// onRateLimit, when set, receives the rate limit headers of every
+	// response that carries them, successful or not.
+	onRateLimit func(*RateLimit)
 }
 
 func (t *statusTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(req)
 	if err != nil {
 		return nil, err
+	}
+	rl := parseRateLimit(resp.Header)
+	if rl != nil && t.onRateLimit != nil {
+		t.onRateLimit(rl)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
@@ -114,6 +140,7 @@ func (t *statusTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			// is 512 bytes of newlines and indentation, so flatten it first.
 			Body:       strings.Join(strings.Fields(string(body)), " "),
 			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+			RateLimit:  rl,
 		}
 	}
 	return resp, nil
@@ -153,14 +180,13 @@ func NewClient(token string) *Client {
 }
 
 func newClientWithEndpoint(url, token string) *Client {
+	c := &Client{token: normalizeToken(token)}
 	httpClient := &http.Client{
 		Timeout:   attemptTimeout,
-		Transport: &statusTransport{base: http.DefaultTransport},
+		Transport: &statusTransport{base: http.DefaultTransport, onRateLimit: c.setRateLimit},
 	}
-	return &Client{
-		gql:   graphql.NewClient(url, graphql.WithHTTPClient(httpClient)),
-		token: normalizeToken(token),
-	}
+	c.gql = graphql.NewClient(url, graphql.WithHTTPClient(httpClient))
+	return c
 }
 
 // normalizeToken ensures the token carries the "Bearer " prefix required by the API.
