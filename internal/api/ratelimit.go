@@ -7,9 +7,8 @@ import (
 	"time"
 )
 
-// Limit is one named rate limit policy and its current state, from the
-// RateLimit-Policy and RateLimit headers. A field is zero when its header or
-// parameter is absent.
+// Limit is one named policy and its state from the RateLimit-Policy and
+// RateLimit headers. Absent values are zero.
 type Limit struct {
 	Name string
 
@@ -21,24 +20,26 @@ type Limit struct {
 	// From RateLimit: "<name>";r=<remaining>;t=<reset_seconds>
 	Remaining int
 	Reset     time.Duration
+
+	// Known is set when RateLimit reported this limit; otherwise Remaining 0
+	// means unknown, not empty.
+	Known bool
 }
 
-// dailyWindow is the shortest window treated as a daily budget rather than a
-// request rate.
+// dailyWindow is the shortest window treated as a daily budget.
 const dailyWindow = 24 * time.Hour
 
-// IsDaily reports whether l is a per-day budget (it is spent, not paced).
+// IsDaily reports whether l is a daily budget, spent rather than paced.
 func (l Limit) IsDaily() bool { return l.Window >= dailyWindow }
 
-// RateLimit holds every policy the API reported on a response. The API sends
-// two: the plan's per-minute rate and a daily budget.
+// RateLimit holds the policies a response reported: the plan's per-minute
+// bucket and the daily budget.
 // See https://docs.hardcover.app/api/getting-started/#ratelimit-headers
 type RateLimit struct {
 	Limits []Limit
 }
 
-// Rate returns the pacing policy: the shortest-window limit with a quota, or
-// nil when none was reported.
+// Rate returns the pacing policy (shortest window with a quota), or nil.
 func (r *RateLimit) Rate() *Limit {
 	var best *Limit
 	for i := range r.Limits {
@@ -53,7 +54,7 @@ func (r *RateLimit) Rate() *Limit {
 	return best
 }
 
-// Daily returns the daily budget, or nil when none was reported.
+// Daily returns the daily budget, or nil.
 func (r *RateLimit) Daily() *Limit {
 	for i := range r.Limits {
 		if r.Limits[i].IsDaily() {
@@ -63,8 +64,8 @@ func (r *RateLimit) Daily() *Limit {
 	return nil
 }
 
-// parseRateLimit reads the rate limit headers, returning nil when neither is
-// present. Malformed parameters are skipped rather than failing the response.
+// parseRateLimit reads the rate limit headers; nil when absent. Malformed
+// parameters are skipped.
 func parseRateLimit(h http.Header) *RateLimit {
 	policy, state := h.Get("RateLimit-Policy"), h.Get("RateLimit")
 	if policy == "" && state == "" {
@@ -103,6 +104,7 @@ func parseRateLimit(h http.Header) *RateLimit {
 			switch k {
 			case "r":
 				l.Remaining = v
+				l.Known = true
 			case "t":
 				l.Reset = time.Duration(v) * time.Second
 			}
@@ -111,8 +113,7 @@ func parseRateLimit(h http.Header) *RateLimit {
 	return rl
 }
 
-// parseRateLimitItem splits `"<name>";k=v;k=v` into the name and its integer
-// parameters.
+// parseRateLimitItem splits `"<name>";k=v;k=v` into name and integer params.
 func parseRateLimitItem(item string) (string, map[string]int) {
 	parts := splitUnquoted(item, ';')
 	name := strings.Trim(strings.TrimSpace(parts[0]), `"`)
@@ -129,9 +130,7 @@ func parseRateLimitItem(item string) (string, map[string]int) {
 	return name, params
 }
 
-// splitUnquoted splits s on sep, ignoring separators inside double quotes
-// (plan names are quoted and could contain either separator). Empty items
-// are dropped.
+// splitUnquoted splits s on sep outside double quotes, dropping empty items.
 func splitUnquoted(s string, sep rune) []string {
 	var out []string
 	var cur strings.Builder

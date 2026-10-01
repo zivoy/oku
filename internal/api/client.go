@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strconv"
@@ -57,6 +59,8 @@ type Client struct {
 	// rateLimitAt when it arrived, both guarded by mu.
 	rateLimit   *RateLimit
 	rateLimitAt time.Time
+	// sentSince counts requests reserved since rateLimit was observed.
+	sentSince int
 }
 
 // LastRateLimit returns the quota state from the most recent response that
@@ -71,6 +75,7 @@ func (c *Client) setRateLimit(rl *RateLimit) {
 	c.mu.Lock()
 	c.rateLimit = rl
 	c.rateLimitAt = time.Now()
+	c.sentSince = 0
 	c.mu.Unlock()
 }
 
@@ -239,10 +244,7 @@ func (c *Client) do(ctx context.Context, req *graphql.Request, resp interface{})
 			break
 		}
 
-		backoff := time.Duration(attempt*attempt) * 200 * time.Millisecond
-		if d := retryAfterDelay(err); d > 0 {
-			backoff = d
-		}
+		backoff := retryDelay(attempt, err)
 		// Sleeping out the deadline would report a bare timeout and throw away
 		// lastErr — the status and body the server actually sent. A Retry-After
 		// longer than the time left is a definite failure, so say so now.
@@ -275,22 +277,45 @@ func remaining(ctx context.Context) time.Duration {
 	return time.Until(deadline)
 }
 
-// throttle spaces requests to respect the API's rate limit: the interval is
-// derived from the policy the API last reported, falling back to
-// minRequestInterval (60 req/min), and an exhausted quota holds requests until
-// its reset. The slot is reserved under the lock and the wait happens outside
-// it, so concurrent callers queue up rather than blocking each other, and a
-// cancelled context aborts the wait.
+// jitterFn returns a random delay in [0, max); a variable so tests can zero it.
+var jitterFn = realJitter
+
+func realJitter(max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	return rand.N(max)
+}
+
+// retryDelay is the wait before the next attempt. Retry-After is a floor, with
+// jitter added on top; the computed backoff uses equal jitter, [base/2, base).
+func retryDelay(attempt int, err error) time.Duration {
+	if d := retryAfterDelay(err); d > 0 {
+		return d + jitterFn(d/4)
+	}
+	base := time.Duration(attempt*attempt) * 200 * time.Millisecond
+	return base/2 + jitterFn(base/2)
+}
+
+// throttle paces requests against the plan's token bucket (see bucketLocked),
+// so a burst goes out back to back and only an empty bucket waits. A spent
+// daily budget holds requests until its reset. With no state known yet it
+// falls back to one request per minRequestInterval. The slot is reserved under
+// the lock and waited out of it, so callers queue and a cancelled ctx aborts.
 func (c *Client) throttle(ctx context.Context) error {
 	c.mu.Lock()
 	now := time.Now()
 	slot := now
-	if !c.lastReq.IsZero() {
+	if tokens, rate, ok := c.bucketLocked(now); ok {
+		if tokens < 1 {
+			slot = now.Add(time.Duration((1 - tokens) / rate * float64(time.Second)))
+		}
+	} else if !c.lastReq.IsZero() {
 		if next := c.lastReq.Add(c.intervalLocked()); next.After(slot) {
 			slot = next
 		}
 	}
-	if resetAt, ok := c.quotaResetLocked(); ok && resetAt.After(slot) {
+	if resetAt, ok := c.dailyExhaustedUntilLocked(); ok && resetAt.After(slot) {
 		slot = resetAt
 	}
 	wait := slot.Sub(now)
@@ -304,11 +329,14 @@ func (c *Client) throttle(ctx context.Context) error {
 	// Record when the request will actually go out, so a backoff that already
 	// covered the interval does not trigger a second full wait.
 	c.lastReq = slot
+	c.sentSince++
 	c.mu.Unlock()
 
 	if wait <= 0 {
 		return nil
 	}
+	// Jitter so clients sharing the bucket don't wake together.
+	wait += jitterFn(wait / 4)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -317,9 +345,26 @@ func (c *Client) throttle(ctx context.Context) error {
 	}
 }
 
-// intervalLocked is the steady-state gap between requests: the plan's window
-// divided by its quota when the API reported one, else minRequestInterval. The
-// daily budget is spent, not paced, so it plays no part. Callers must hold c.mu.
+// bucketLocked estimates the plan bucket's tokens now: the reported Remaining,
+// refilled at Quota/Window up to Burst, minus requests sent since. ok is false
+// until the plan's state is known. Callers must hold c.mu.
+func (c *Client) bucketLocked(now time.Time) (tokens, rate float64, ok bool) {
+	if c.rateLimit == nil {
+		return 0, 0, false
+	}
+	plan := c.rateLimit.Rate()
+	if plan == nil || !plan.Known {
+		return 0, 0, false
+	}
+	rate = float64(plan.Quota) / plan.Window.Seconds()
+	capacity := float64(max(plan.Burst, 1))
+	elapsed := now.Sub(c.rateLimitAt).Seconds()
+	tokens = math.Min(capacity, float64(plan.Remaining)+elapsed*rate)
+	return tokens - float64(c.sentSince), rate, true
+}
+
+// intervalLocked is the fallback request gap while the plan's state is unknown:
+// Window/Quota if a policy was seen, else minRequestInterval. Callers hold c.mu.
 func (c *Client) intervalLocked() time.Duration {
 	if c.rateLimit != nil {
 		if l := c.rateLimit.Rate(); l != nil {
@@ -331,22 +376,18 @@ func (c *Client) intervalLocked() time.Duration {
 	return minRequestInterval
 }
 
-// quotaResetLocked reports when the latest exhausted limit refills. ok is
-// false when every limit has requests left, no state is known, or the reset
-// has already passed. A reset of 0 means the RateLimit header carried no t, so
-// an empty-looking limit can't be trusted. Callers must hold c.mu.
-func (c *Client) quotaResetLocked() (resetAt time.Time, ok bool) {
+// dailyExhaustedUntilLocked reports when a spent daily budget resets. The API
+// drops the plan from RateLimit once daily is spent, so this is the only signal
+// then. Callers must hold c.mu.
+func (c *Client) dailyExhaustedUntilLocked() (resetAt time.Time, ok bool) {
 	if c.rateLimit == nil {
 		return time.Time{}, false
 	}
-	for _, l := range c.rateLimit.Limits {
-		if l.Remaining > 0 || l.Reset <= 0 {
-			continue
-		}
-		if at := c.rateLimitAt.Add(l.Reset); at.After(resetAt) {
-			resetAt = at
-		}
+	d := c.rateLimit.Daily()
+	if d == nil || !d.Known || d.Reset <= 0 || d.Remaining-c.sentSince >= 1 {
+		return time.Time{}, false
 	}
+	resetAt = c.rateLimitAt.Add(d.Reset)
 	return resetAt, resetAt.After(time.Now())
 }
 
